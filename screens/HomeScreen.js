@@ -7,23 +7,23 @@ import {
   StyleSheet,
   TouchableOpacity,
   Alert,
+  Linking,
 } from 'react-native';
 import Geolocation from 'react-native-geolocation-service';
 import MapView, { Marker } from 'react-native-maps';
+import haversine from 'haversine-distance';
+import { connectToMQTT, onMQTTMessage, disconnectMQTT } from '../mqttClient';
+import mqtt from 'mqtt';
+
+const MQTT_BROKER = 'ws://ionlypfw.thddns.net:2025';
+const TOPIC_SOS = 'soschannel';
 
 export default function HomeScreen({ navigation }) {
   const [location, setLocation] = useState(null);
+  const [mqttDataMap, setMqttDataMap] = useState({});
+  const [selectedHat, setSelectedHat] = useState(null);
   const mapRef = useRef(null);
-
-  const testLocation1 = {
-    latitude: 13.777687813454191,
-    longitude: 100.76567895334587,
-  };
-
-  const testLocation2 = {
-    latitude: 13.777641413286592,
-    longitude: 100.76597818652411,
-  };
+  const clientRef = useRef(null);
 
   useEffect(() => {
     const requestLocationPermission = async () => {
@@ -49,17 +49,57 @@ export default function HomeScreen({ navigation }) {
   }, []);
 
   useEffect(() => {
-    if (mapRef.current) {
-      mapRef.current.fitToCoordinates([testLocation1, testLocation2], {
-        edgePadding: { top: 80, right: 80, bottom: 80, left: 80 },
-        animated: true,
-      });
-    }
+    connectToMQTT();
+
+    onMQTTMessage((message) => {
+      setMqttDataMap(prev => ({
+        ...prev,
+        [message.hatId]: message
+      }));
+
+      if (mapRef.current && message.latitude && message.longitude) {
+        mapRef.current.animateToRegion({
+          latitude: parseFloat(message.latitude),
+          longitude: parseFloat(message.longitude),
+          latitudeDelta: 0.005,
+          longitudeDelta: 0.005,
+        });
+      }
+    });
+
+    clientRef.current = mqtt.connect(MQTT_BROKER);
+
+    return () => {
+      disconnectMQTT();
+      if (clientRef.current) {
+        clientRef.current.end();
+      }
+    };
   }, []);
 
-  const handleSOS = () => {
-    Alert.alert('🚨 SOS Triggered', 'This is a mock SOS alert.');
+  const getDistance = (target) => {
+    if (!location || !target) return null;
+    const from = { latitude: location.latitude, longitude: location.longitude };
+    const to = { latitude: parseFloat(target.latitude), longitude: parseFloat(target.longitude) };
+    const distanceInMeters = haversine(from, to);
+    return (distanceInMeters / 1000).toFixed(2);
   };
+
+  const handleNavigate = (target) => {
+    if (target?.latitude && target?.longitude) {
+      const url = `https://www.google.com/maps/dir/?api=1&destination=${target.latitude},${target.longitude}`;
+      Linking.openURL(url);
+    }
+  };
+
+  const handleSOS = () => {
+    if (clientRef.current) {
+      clientRef.current.publish(TOPIC_SOS, 'sos');
+      Alert.alert('🚨 SOS Sent', 'ส่งสัญญาณฉุกเฉินไปยังหมวกทุกใบแล้ว');
+    }
+  };
+
+  const hatIds = Object.keys(mqttDataMap);
 
   return (
     <View style={styles.container}>
@@ -67,28 +107,44 @@ export default function HomeScreen({ navigation }) {
         ref={mapRef}
         style={styles.map}
         showsUserLocation={true}
+        initialRegion={{
+          latitude: location?.latitude || 13.736717,
+          longitude: location?.longitude || 100.523186,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        }}
       >
-        <Marker
-          coordinate={testLocation1}
-          title="Test Device"
-          description="Simulated online device"
-        />
-        <Marker
-          coordinate={testLocation2}
-          title="Nearby Device"
-          description="Another simulated device"
-        />
+        {hatIds.map((hatId) => {
+          const data = mqttDataMap[hatId];
+          if (!data?.latitude || !data?.longitude) return null;
+          return (
+            <Marker
+              key={hatId}
+              coordinate={{
+                latitude: parseFloat(data.latitude),
+                longitude: parseFloat(data.longitude),
+              }}
+              title={`Helmet ${hatId}`}
+              description={selectedHat === hatId && location ? `ห่าง ${getDistance(data)} กม.` : ''}
+              pinColor={selectedHat === hatId ? 'blue' : 'red'}
+              onPress={() => setSelectedHat(hatId)}
+            />
+          );
+        })}
       </MapView>
 
-      <View style={styles.separator} />
+      <View style={styles.infoContainer}>
+        <Text style={styles.mqttText}>
+          จำนวนคนงานในไซต์: {hatIds.length} คน
+        </Text>
 
-      <View style={styles.info}>
-        {location ? (
-          <Text style={styles.locationText}>
-            Latitude: {location.latitude}, Longitude: {location.longitude}
-          </Text>
-        ) : (
-          <Text style={styles.locationText}>Getting Location...</Text>
+        {selectedHat && mqttDataMap[selectedHat] && (
+          <TouchableOpacity
+            style={styles.navigateButton}
+            onPress={() => handleNavigate(mqttDataMap[selectedHat])}
+          >
+            <Text style={styles.navigateText}>นำทางไปยังหมวก {selectedHat}</Text>
+          </TouchableOpacity>
         )}
 
         <View style={styles.buttonRow}>
@@ -109,31 +165,18 @@ export default function HomeScreen({ navigation }) {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  map: {
-    flex: 2,
-  },
-  separator: {
-    height: 1,
-    backgroundColor: '#ccc',
-    width: '100%',
-  },
-  info: {
-    flex: 1,
+  container: { flex: 1 },
+  map: { flex: 3 },
+  infoContainer: {
+    flex: 1.2,
     justifyContent: 'center',
     alignItems: 'center',
     padding: 16,
   },
-  locationText: {
-    marginBottom: 16,
-    fontSize: 16,
-    textAlign: 'center',
-  },
   buttonRow: {
     flexDirection: 'row',
     gap: 16,
+    marginTop: 16,
   },
   viewButton: {
     backgroundColor: '#4CAF50',
@@ -158,5 +201,22 @@ const styles = StyleSheet.create({
     color: 'white',
     fontWeight: 'bold',
     fontSize: 16,
+  },
+  mqttText: {
+    fontSize: 16,
+    textAlign: 'center',
+    color: '#333',
+  },
+  navigateButton: {
+    marginTop: 10,
+    backgroundColor: '#2196F3',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  navigateText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '500',
   },
 });

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';  
+import React, { useState, useEffect } from 'react';
 import {
   View,
   FlatList,
@@ -16,16 +16,32 @@ import * as FileSystem from 'expo-file-system';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { connectToMQTT, onMQTTMessage, disconnectMQTT } from '../mqttClient';
 
 export default function WorkerListScreen({ navigation }) {
   const [workers, setWorkers] = useState([]);
   const [modalVisible, setModalVisible] = useState(false);
-
   const [searchQuery, setSearchQuery] = useState('');
   const [searchField, setSearchField] = useState('name');
+  const [mqttDataMap, setMqttDataMap] = useState({});
 
   useEffect(() => {
     loadWorkers();
+  }, []);
+
+  useEffect(() => {
+    connectToMQTT();
+
+    onMQTTMessage((data) => {
+      setMqttDataMap((prev) => ({
+        ...prev,
+        [data.hatId]: data.helmetStatus,
+      }));
+    });
+
+    return () => {
+      disconnectMQTT();
+    };
   }, []);
 
   const loadWorkers = async () => {
@@ -71,66 +87,82 @@ export default function WorkerListScreen({ navigation }) {
         return;
       }
 
-      // เติม default value ถ้ายังไม่มี
-      newData = newData.map(item => ({
-        ...item,
+      newData = newData.map((item) => ({
+        hatId: item.hatId?.toString(),
+        name: item.name || '',
+        role: item.role || '',
         bloodType: item.bloodType || '',
         nationality: item.nationality || '',
         image: item.image || '',
+        age: item.age || '',
+        gender: item.gender || '',
       }));
 
-      Alert.alert(
-        'ต้องการดำเนินการอย่างไร?',
-        '',
-        [
-          {
-            text: 'เพิ่มใหม่',
-            onPress: () => {
-              const combined = [...workers];
-              newData.forEach((item) => {
-                const isDuplicate = combined.some((w) => w.id === item.id && w.name === item.name);
-                if (!isDuplicate) {
-                  combined.push(item);
-                }
-              });
-              saveWorkers(combined);
-            },
+      Alert.alert('ต้องการดำเนินการอย่างไร?', '', [
+        {
+          text: 'เพิ่มใหม่',
+          onPress: () => {
+            const combined = [...workers];
+            newData.forEach((item) => {
+              const isDuplicate = combined.some((w) => w.hatId === item.hatId && w.name === item.name);
+              if (!isDuplicate) {
+                combined.push(item);
+              }
+            });
+            saveWorkers(combined);
           },
-          {
-            text: 'แทนที่ทั้งหมด',
-            onPress: () => saveWorkers(newData),
-            style: 'destructive',
-          },
-          { text: 'ยกเลิก', style: 'cancel' },
-        ]
-      );
+        },
+        {
+          text: 'แทนที่ทั้งหมด',
+          onPress: () => saveWorkers(newData),
+          style: 'destructive',
+        },
+        { text: 'ยกเลิก', style: 'cancel' },
+      ]);
     } catch (error) {
       alert('เกิดข้อผิดพลาด: ' + error.message);
     }
   };
 
   const filteredWorkers = workers.filter((worker) =>
-    worker[searchField]
-      ?.toString()
-      .toLowerCase()
-      .includes(searchQuery.toLowerCase())
+    worker[searchField]?.toString().toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const renderItem = ({ item }) => (
-    <TouchableOpacity
-      style={styles.listItem}
-      onPress={() => navigation.navigate('WorkerDetails', { worker: item })}
-    >
-      <Image
-        source={{ uri: item.image?.startsWith('data:image') ? item.image : (item.image || 'https://via.placeholder.com/50') }}
-        style={styles.avatar}
-      />
-      <View>
-        <Text style={styles.name}>{item.name}</Text>
-        <Text style={styles.role}>{item.role}</Text>
-      </View>
-    </TouchableOpacity>
-  );
+  const renderItem = ({ item }) => {
+    const status = mqttDataMap[item.hatId];
+    let statusText = 'offline';
+    let color = 'gray';
+
+    if (status === '0' || status === 0) {
+      statusText = 'normal';
+      color = 'green';
+    } else if (status === '1' || status === 1) {
+      statusText = 'sos';
+      color = 'red';
+    }
+
+    return (
+      <TouchableOpacity
+        style={styles.listItem}
+        onPress={() => navigation.navigate('WorkerDetails', { worker: item })}
+      >
+        <Image
+          source={{
+            uri: item.image?.startsWith('data:image') ? item.image : item.image || 'https://via.placeholder.com/50',
+          }}
+          style={styles.avatar}
+        />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.name}>{item.name}</Text>
+          <Text style={styles.role}>{item.role}</Text>
+        </View>
+        <View style={styles.statusContainer}>
+          <View style={[styles.statusDot, { backgroundColor: color }]} />
+          <Text style={styles.statusText}>{statusText}</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <View style={{ flex: 1, padding: 16 }}>
@@ -154,7 +186,7 @@ export default function WorkerListScreen({ navigation }) {
       ) : (
         <FlatList
           data={filteredWorkers}
-          keyExtractor={(item, index) => item.id?.toString() || index.toString()}
+          keyExtractor={(item, index) => item.hatId?.toString() || index.toString()}
           renderItem={renderItem}
         />
       )}
@@ -177,7 +209,7 @@ export function WorkerDetailScreen({ route }) {
   return (
     <View style={styles.detailContainer}>
       <Image
-        source={{ uri: worker.image?.startsWith('data:image') ? worker.image : (worker.image || 'https://via.placeholder.com/150') }}
+        source={{ uri: worker.image?.startsWith('data:image') ? worker.image : worker.image || 'https://via.placeholder.com/150' }}
         style={styles.detailImage}
       />
       <Text style={styles.detailName}>{worker.name}</Text>
@@ -239,5 +271,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginTop: 8,
+  },
+  statusContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 12,
+  },
+  statusDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    marginBottom: 4,
+  },
+  statusText: {
+    fontSize: 12,
+    color: '#555',
   },
 });
