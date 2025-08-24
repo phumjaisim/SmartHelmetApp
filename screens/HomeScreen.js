@@ -1,443 +1,709 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
-  PermissionsAndroid,
-  Platform,
   StyleSheet,
   TouchableOpacity,
   Alert,
   Linking,
+  StatusBar,
+  Dimensions,
   ScrollView,
-  SafeAreaView,
-  RefreshControl
+  ActivityIndicator,
+  Animated,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Ionicons } from '@expo/vector-icons';
-import Geolocation from 'react-native-geolocation-service';
-import MapView, { Marker } from 'react-native-maps';
-import haversine from 'haversine-distance';
-import { connectToMQTT, onMQTTMessage, disconnectMQTT } from '../mqttClient';
-import { Button, Card, StatusBadge, Header } from '../components/UIComponents';
-import { theme } from '../theme';
-import * as Animatable from 'react-native-animatable';
-import mqtt from 'mqtt';
+import { FontAwesome, MaterialIcons, Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
+import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import { connectToMQTT, onMQTTMessage, publishSOS, getMQTTStatus } from '../mqttClient';
+import { calculateDistance, safeJsonParse } from '../utils';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const MQTT_BROKER = 'ws://ionlypfw.thddns.net:2025';
-const TOPIC_SOS = 'soschannel';
+const { width, height } = Dimensions.get('window');
 
-export default function HomeScreen({ navigation }) {
+const HomeScreen = React.memo(({ navigation }) => {
   const [location, setLocation] = useState(null);
   const [mqttDataMap, setMqttDataMap] = useState({});
   const [selectedHat, setSelectedHat] = useState(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [isMapReady, setIsMapReady] = useState(false);
+  const [isLoadingLocation, setIsLoadingLocation] = useState(true);
+  const [mqttStatus, setMqttStatus] = useState({ connected: false, connecting: false });
+  const [totalWorkers, setTotalWorkers] = useState(0);
+  
   const mapRef = useRef(null);
-  const clientRef = useRef(null);
+  const mqttUnsubscribeRef = useRef(null);
 
+  // Optimized location permission and fetching using Expo Location
   useEffect(() => {
     const requestLocationPermission = async () => {
-      if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-        );
-        if (granted !== PermissionsAndroid.RESULTS.GRANTED) return;
-      }
+      try {
+        setIsLoadingLocation(true);
+        
+        // Request foreground permissions first
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          console.log('Location permission denied');
+          Alert.alert(
+            'Location Permission Required',
+            'This app needs location permission to track helmet positions.'
+          );
+          setIsLoadingLocation(false);
+          return;
+        }
 
-      Geolocation.getCurrentPosition(
-        position => {
-          setLocation(position.coords);
-        },
-        error => {
-          console.error(error);
-        },
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
-      );
+        // Get current location
+        const currentLocation = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.High,
+          timeout: 15000,
+          maximumAge: 10000,
+        });
+        
+        setLocation({
+          latitude: currentLocation.coords.latitude,
+          longitude: currentLocation.coords.longitude,
+        });
+        
+        console.log('Location obtained:', currentLocation.coords);
+        setIsLoadingLocation(false);
+      } catch (error) {
+        console.error('Location error:', error);
+        Alert.alert(
+          'Location Error',
+          'Unable to get your location. Please check your location settings.'
+        );
+        setIsLoadingLocation(false);
+      }
     };
 
     requestLocationPermission();
   }, []);
 
+  // Optimized MQTT connection and message handling
   useEffect(() => {
-    connectToMQTT();
-
-    onMQTTMessage((message) => {
-      setMqttDataMap(prev => ({
-        ...prev,
-        [message.hatId]: message
-      }));
-
-      if (mapRef.current && message.latitude && message.longitude) {
-        mapRef.current.animateToRegion({
-          latitude: parseFloat(message.latitude),
-          longitude: parseFloat(message.longitude),
-          latitudeDelta: 0.005,
-          longitudeDelta: 0.005,
+    const initializeMQTT = async () => {
+      try {
+        await connectToMQTT();
+        setMqttStatus(getMQTTStatus());
+        
+        // Subscribe to MQTT messages with cleanup function
+        mqttUnsubscribeRef.current = onMQTTMessage((message) => {
+          setMqttDataMap(prev => ({
+            ...prev,
+            [message.hatId]: {
+              ...message,
+              timestamp: Date.now() // Add timestamp for real-time updates
+            }
+          }));
         });
+      } catch (error) {
+        console.error('MQTT initialization error:', error);
+        Alert.alert('การเชื่อมต่อล้มเหลว', 'ไม่สามารถเชื่อมต่อ MQTT ได้');
       }
-    });
+    };
 
-    clientRef.current = mqtt.connect(MQTT_BROKER);
+    initializeMQTT();
+
+    // Periodic status check
+    const statusInterval = setInterval(() => {
+      setMqttStatus(getMQTTStatus());
+    }, 5000);
 
     return () => {
-      disconnectMQTT();
-      if (clientRef.current) {
-        clientRef.current.end();
+      clearInterval(statusInterval);
+      if (mqttUnsubscribeRef.current) {
+        mqttUnsubscribeRef.current();
       }
     };
   }, []);
 
-  const getDistance = (target) => {
-    if (!location || !target) return null;
-    const from = { latitude: location.latitude, longitude: location.longitude };
-    const to = { latitude: parseFloat(target.latitude), longitude: parseFloat(target.longitude) };
-    const distanceInMeters = haversine(from, to);
-    return (distanceInMeters / 1000).toFixed(2);
-  };
+  // Load total workers count from AsyncStorage
+  useEffect(() => {
+    const loadTotalWorkers = async () => {
+      try {
+        const stored = await AsyncStorage.getItem('workers');
+        if (stored) {
+          const parsedWorkers = safeJsonParse(stored, []);
+          setTotalWorkers(parsedWorkers.length);
+        }
+      } catch (error) {
+        console.error('Load total workers error:', error);
+      }
+    };
 
-  const handleNavigate = (target) => {
+    loadTotalWorkers();
+  }, []);
+
+  // Optimized distance calculation using utility function
+  const getDistance = useCallback((target) => {
+    return calculateDistance(location, target);
+  }, [location]);
+
+  // Memoized navigation handler
+  const handleNavigate = useCallback((target) => {
     if (target?.latitude && target?.longitude) {
       const url = `https://www.google.com/maps/dir/?api=1&destination=${target.latitude},${target.longitude}`;
-      Linking.openURL(url);
+      Linking.openURL(url).catch(err => {
+        console.error('Navigation error:', err);
+        Alert.alert('ข้อผิดพลาด', 'ไม่สามารถเปิดแอปแผนที่ได้');
+      });
     }
-  };
+  }, []);
 
-  const handleSOS = () => {
-    Alert.alert(
-      '🚨 ส่งสัญญาณฉุกเฉิน',
-      'คุณแน่ใจหรือไม่ว่าต้องการส่งสัญญาณฉุกเฉินไปยังหมวกทุกใบ?',
-      [
-        { text: 'ยกเลิก', style: 'cancel' },
-        { 
-          text: 'ส่งสัญญาณ', 
-          style: 'destructive',
-          onPress: () => {
-            if (clientRef.current) {
-              clientRef.current.publish(TOPIC_SOS, 'sos');
-              Alert.alert('✅ ส่งสำเร็จ', 'ส่งสัญญาณฉุกเฉินไปยังหมวกทุกใบแล้ว');
-            }
-          }
+  // Optimized SOS handler
+  const handleSOS = useCallback(() => {
+    try {
+      publishSOS(); // Sends 'sos' as default message for global SOS
+      Alert.alert('🚨 Global SOS', 'All Helmets sending SOS Signal');
+    } catch (error) {
+      console.error('SOS send error:', error);
+      Alert.alert('ข้อผิดพลาด', 'ไม่สามารถส่งสัญญาณ SOS ได้');
+    }
+  }, []);
+
+  // Memoized calculations
+  const hatIds = useMemo(() => Object.keys(mqttDataMap), [mqttDataMap]);
+  
+  const initialRegion = useMemo(() => ({
+    latitude: location?.latitude || 13.736717,
+    longitude: location?.longitude || 100.523186,
+    latitudeDelta: 0.01,
+    longitudeDelta: 0.01,
+  }), [location]);
+
+  const selectedHatData = useMemo(() => 
+    selectedHat ? mqttDataMap[selectedHat] : null, 
+    [selectedHat, mqttDataMap]
+  );
+
+  // Analytics data calculations
+  const analytics = useMemo(() => {
+    // Use totalWorkers from AsyncStorage for accurate count
+    const total = totalWorkers;
+    let online = 0;
+    let sos = 0;
+    let averageHeartRate = 0;
+    let heartRateSum = 0;
+    let heartRateCount = 0;
+
+    // Only count MQTT data for online status
+    hatIds.forEach(hatId => {
+      const data = mqttDataMap[hatId];
+      if (data) {
+        online++;
+        if (data.helmetStatus === 'SOS' || data.helmetStatus === 'EMERGENCY') {
+          sos++;
         }
-      ]
+        if (data.heartRate && data.heartRate !== 'N/A' && data.heartRate > 0) {
+          heartRateSum += parseInt(data.heartRate);
+          heartRateCount++;
+        }
+      }
+    });
+
+    if (heartRateCount > 0) {
+      averageHeartRate = Math.round(heartRateSum / heartRateCount);
+    }
+
+    return {
+      total,
+      online,
+      offline: total - online,
+      sos,
+      averageHeartRate: heartRateCount > 0 ? averageHeartRate : 'N/A'
+    };
+  }, [totalWorkers, hatIds, mqttDataMap]);
+
+  // Get marker color based on helmet status
+  const getMarkerColor = useCallback((data, hatId) => {
+    if (selectedHat === hatId) return '#2196f3'; // Blue for selected
+    if (data.helmetStatus === 'SOS' || data.helmetStatus === 'EMERGENCY') return '#ff1744'; // Red for SOS
+    return '#4caf50'; // Green for normal
+  }, [selectedHat]);
+
+  if (isLoadingLocation) {
+    return (
+      <View style={styles.modernContainer}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a237e" />
+        <LinearGradient
+          colors={['#1a237e', '#3949ab']}
+          style={styles.loadingHeader}
+        >
+          <MaterialIcons name="location-searching" size={32} color="white" />
+          <Text style={styles.loadingHeaderText}>Smart Helmet Monitor</Text>
+        </LinearGradient>
+        <View style={styles.loadingContent}>
+          <ActivityIndicator size="large" color="#1976d2" />
+          <Text style={styles.modernLoadingText}>Getting your location...</Text>
+        </View>
+      </View>
     );
-  };
-
-  const onRefresh = async () => {
-    setRefreshing(true);
-    // Simulate refresh
-    setTimeout(() => {
-      setRefreshing(false);
-    }, 1000);
-  };
-
-  const hatIds = Object.keys(mqttDataMap);
-  const onlineWorkers = hatIds.filter(id => mqttDataMap[id]?.helmetStatus !== undefined);
-  const sosWorkers = hatIds.filter(id => mqttDataMap[id]?.helmetStatus === '1' || mqttDataMap[id]?.helmetStatus === 1);
+  }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
+    <View style={styles.modernContainer}>
+      <StatusBar barStyle="light-content" backgroundColor="#1a237e" />
       
-      {/* Header */}
+      {/* Modern Header with Live Stats */}
       <LinearGradient
-        colors={theme.colors.gradient.primary}
-        style={styles.headerContainer}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 0 }}
+        colors={['#1a237e', '#3949ab']}
+        style={styles.modernHeader}
       >
         <View style={styles.headerContent}>
           <View style={styles.headerLeft}>
-            <Text style={styles.headerTitle}>Smart Helmet</Text>
-            <Text style={styles.headerSubtitle}>ระบบตรวจสอบความปลอดภัย</Text>
+            <MaterialIcons name="dashboard" size={32} color="white" />
+            <View style={styles.headerTextContainer}>
+              <Text style={styles.headerTitle}>TUPP Construction Site</Text>
+              <View style={styles.connectionStatusContainer}>
+                <View style={[
+                  styles.connectionDot, 
+                  { backgroundColor: mqttStatus.connected ? '#4caf50' : '#ff5722' }
+                ]} />
+                <Text style={styles.connectionText}>
+                  {mqttStatus.connected ? 'Connected' : 'Disconnected'}
+                </Text>
+              </View>
+            </View>
           </View>
+          
           <TouchableOpacity 
-            style={styles.profileButton}
-            onPress={() => navigation.openDrawer?.() || null}
+            style={styles.refreshButton}
+            onPress={async () => {
+              try {
+                // Force refresh MQTT connection and data
+                await connectToMQTT();
+                setMqttStatus(getMQTTStatus());
+                
+                // Clear current data to force refresh
+                setMqttDataMap({});
+                
+                // Re-center map to current location
+                if (mapRef.current && location) {
+                  mapRef.current.animateToRegion(initialRegion, 1000);
+                }
+                
+                console.log('🔄 Live tracking refreshed');
+              } catch (error) {
+                console.error('Refresh error:', error);
+                Alert.alert('Refresh Error', 'Failed to refresh live tracking');
+              }
+            }}
           >
-            <Ionicons name="person-circle" size={40} color={theme.colors.text.white} />
+            <MaterialIcons name="refresh" size={24} color="white" />
           </TouchableOpacity>
         </View>
       </LinearGradient>
 
-      {/* Stats Cards */}
-      <Animatable.View animation="fadeInUp" duration={800} style={styles.statsContainer}>
-        <ScrollView 
-          horizontal 
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.statsScrollContent}
-        >
-          <Card style={[styles.statCard, { backgroundColor: theme.colors.status.info }]}>
-            <View style={styles.statContent}>
-              <Ionicons name="people" size={32} color={theme.colors.text.white} />
-              <View style={styles.statText}>
-                <Text style={styles.statNumber}>{hatIds.length}</Text>
-                <Text style={styles.statLabel}>พนักงานทั้งหมด</Text>
-              </View>
-            </View>
-          </Card>
-          
-          <Card style={[styles.statCard, { backgroundColor: theme.colors.status.success }]}>
-            <View style={styles.statContent}>
-              <Ionicons name="shield-checkmark" size={32} color={theme.colors.text.white} />
-              <View style={styles.statText}>
-                <Text style={styles.statNumber}>{onlineWorkers.length}</Text>
-                <Text style={styles.statLabel}>ออนไลน์</Text>
-              </View>
-            </View>
-          </Card>
-          
-          <Card style={[styles.statCard, { backgroundColor: theme.colors.status.danger }]}>
-            <View style={styles.statContent}>
-              <Ionicons name="warning" size={32} color={theme.colors.text.white} />
-              <View style={styles.statText}>
-                <Text style={styles.statNumber}>{sosWorkers.length}</Text>
-                <Text style={styles.statLabel}>สัญญาณฉุกเฉิน</Text>
-              </View>
-            </View>
-          </Card>
-        </ScrollView>
-      </Animatable.View>
-
-      {/* Map Container */}
-      <Animatable.View animation="fadeInUp" delay={200} duration={800} style={styles.mapContainer}>
-        <Card style={styles.mapCard}>
-          <View style={styles.mapHeader}>
-            <Text style={styles.mapTitle}>ตำแหน่งพนักงาน</Text>
-            <TouchableOpacity onPress={() => mapRef.current?.animateToRegion({
-              latitude: location?.latitude || 13.736717,
-              longitude: location?.longitude || 100.523186,
-              latitudeDelta: 0.01,
-              longitudeDelta: 0.01,
-            })}>
-              <Ionicons name="locate" size={24} color={theme.colors.primary} />
-            </TouchableOpacity>
-          </View>
-          
-          <MapView
-            ref={mapRef}
-            style={styles.map}
-            showsUserLocation={true}
-            onMapReady={() => setIsMapReady(true)}
-            initialRegion={{
-              latitude: location?.latitude || 13.736717,
-              longitude: location?.longitude || 100.523186,
-              latitudeDelta: 0.01,
-              longitudeDelta: 0.01,
-            }}
+      {/* Analytics Cards - Only Total and Online */}
+      <View style={styles.analyticsRow}>
+        <View style={styles.analyticsCard}>
+          <LinearGradient
+            colors={['#4caf50', '#2e7d32']}
+            style={styles.cardGradient}
           >
-            {hatIds.map((hatId) => {
-              const data = mqttDataMap[hatId];
-              if (!data?.latitude || !data?.longitude) return null;
-              const isSelected = selectedHat === hatId;
-              const isSOS = data.helmetStatus === '1' || data.helmetStatus === 1;
-              
-              return (
-                <Marker
-                  key={hatId}
-                  coordinate={{
-                    latitude: parseFloat(data.latitude),
-                    longitude: parseFloat(data.longitude),
-                  }}
-                  title={`หมวก ${hatId}`}
-                  description={`สถานะ: ${isSOS ? 'ฉุกเฉิน!' : 'ปกติ'}`}
-                  pinColor={isSOS ? '#DC3545' : isSelected ? '#2E86AB' : '#28A745'}
-                  onPress={() => setSelectedHat(hatId)}
-                >
-                  <View style={[
-                    styles.customMarker,
-                    { 
-                      backgroundColor: isSOS ? theme.colors.status.danger : 
-                                     isSelected ? theme.colors.secondary : theme.colors.status.success 
-                    }
-                  ]}>
-                    <Ionicons 
-                      name={isSOS ? "warning" : "person"} 
-                      size={20} 
-                      color={theme.colors.text.white} 
-                    />
-                  </View>
-                </Marker>
-              );
-            })}
-          </MapView>
-          
-          {/* Selected Worker Info */}
-          {selectedHat && mqttDataMap[selectedHat] && (
-            <Animatable.View animation="slideInUp" style={styles.selectedWorkerInfo}>
-              <View style={styles.workerInfoContent}>
-                <Text style={styles.workerInfoTitle}>หมวก {selectedHat}</Text>
-                <Text style={styles.workerInfoDistance}>
-                  ระยะห่าง: {getDistance(mqttDataMap[selectedHat])} กม.
-                </Text>
-                <StatusBadge 
-                  status={mqttDataMap[selectedHat].helmetStatus === '1' ? 'danger' : 'normal'}
-                  text={mqttDataMap[selectedHat].helmetStatus === '1' ? 'ฉุกเฉิน' : 'ปกติ'}
-                />
-              </View>
-              <Button
-                title="นำทาง"
-                size="small"
-                icon="navigate"
-                onPress={() => handleNavigate(mqttDataMap[selectedHat])}
-              />
-            </Animatable.View>
-          )}
-        </Card>
-      </Animatable.View>
-
-      {/* Action Buttons */}
-      <Animatable.View animation="fadeInUp" delay={400} duration={800} style={styles.actionContainer}>
-        <View style={styles.actionButtons}>
-          <Button
-            title="รายชื่อพนักงาน"
-            variant="secondary"
-            icon="people"
-            style={{ flex: 1, marginRight: theme.spacing.sm }}
-            onPress={() => navigation.navigate('Workers')}
-          />
-          <Button
-            title="SOS"
-            variant="danger"
-            icon="warning"
-            style={{ flex: 1, marginLeft: theme.spacing.sm }}
-            onPress={handleSOS}
-          />
+            <MaterialIcons name="people" size={24} color="white" />
+            <Text style={styles.cardValue}>{analytics.total}</Text>
+            <Text style={styles.cardLabel}>Total Workers</Text>
+          </LinearGradient>
         </View>
-      </Animatable.View>
-    </SafeAreaView>
+        
+        <View style={styles.analyticsCard}>
+          <LinearGradient
+            colors={['#2196f3', '#1565c0']}
+            style={styles.cardGradient}
+          >
+            <MaterialIcons name="wifi" size={24} color="white" />
+            <Text style={styles.cardValue}>{analytics.online}</Text>
+            <Text style={styles.cardLabel}>Online</Text>
+          </LinearGradient>
+        </View>
+      </View>
+
+      {/* Full Screen Map Section */}
+      <View style={styles.fullMapContainer}>
+        <View style={styles.mapHeader}>
+          <Text style={styles.mapTitle}>Live Tracking</Text>
+          {selectedHat && (
+            <TouchableOpacity
+              style={styles.clearSelectionButton}
+              onPress={() => setSelectedHat(null)}
+            >
+              <Text style={styles.clearSelectionText}>Clear Selection</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        
+        <MapView
+          ref={mapRef}
+          provider={PROVIDER_GOOGLE}
+          style={styles.modernMap}
+          showsUserLocation={true}
+          showsMyLocationButton={true}
+          initialRegion={initialRegion}
+          mapType="standard"
+          loadingEnabled={false}
+          moveOnMarkerPress={false}
+          showsBuildings={true}
+          showsCompass={true}
+          showsScale={false}
+          showsTraffic={false}
+          zoomEnabled={true}
+          scrollEnabled={true}
+          pitchEnabled={true}
+          rotateEnabled={true}
+          maxZoomLevel={18}
+          minZoomLevel={5}
+        >
+          {hatIds.map((hatId) => {
+            const data = mqttDataMap[hatId];
+            if (!data?.latitude || !data?.longitude) return null;
+            
+            const isSelected = selectedHat === hatId;
+            const isEmergency = data.helmetStatus === 'SOS' || data.helmetStatus === 'EMERGENCY';
+            
+            return (
+              <Marker
+                key={hatId}
+                coordinate={{
+                  latitude: parseFloat(data.latitude),
+                  longitude: parseFloat(data.longitude),
+                }}
+                title={`Helmet ${hatId}`}
+                description={`${isEmergency ? '🚨 EMERGENCY | ' : ''}${isSelected && location ? `Distance: ${getDistance(data)}km` : 'Tap for details'}`}
+                pinColor={getMarkerColor(data, hatId)}
+                onPress={() => setSelectedHat(hatId)}
+              >
+                {isEmergency && (
+                  <View style={styles.emergencyMarker}>
+                    <MaterialIcons name="warning" size={20} color="white" />
+                  </View>
+                )}
+              </Marker>
+            );
+          })}
+        </MapView>
+
+        {/* Selected Worker Info */}
+        {selectedHat && selectedHatData && (
+          <View style={styles.selectedWorkerInfo}>
+            <View style={styles.workerInfoCard}>
+              <View style={styles.workerInfoLeft}>
+                <Text style={styles.selectedWorkerTitle}>Helmet {selectedHat}</Text>
+                <Text style={styles.selectedWorkerDetails}>
+                  Status: {selectedHatData.helmetStatus || 'Normal'} | 
+                  Heart Rate: {selectedHatData.heartRate || 'N/A'} BPM
+                  {location && ` | Distance: ${getDistance(selectedHatData)}km`}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.navigateIconButton}
+                onPress={() => handleNavigate(selectedHatData)}
+              >
+                <MaterialIcons name="navigation" size={24} color="white" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </View>
+
+      {/* Bottom Actions */}
+      <View style={styles.bottomActions}>
+        <TouchableOpacity
+          style={styles.modernViewButton}
+          onPress={() => navigation.navigate('Workers')}
+        >
+          <LinearGradient
+            colors={['#4caf50', '#2e7d32']}
+            style={styles.actionButtonGradient}
+          >
+            <MaterialIcons name="list" size={20} color="white" />
+            <Text style={styles.actionButtonText}>View All Workers</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={styles.modernSosButton} 
+          onPress={handleSOS}
+        >
+          <LinearGradient
+            colors={['#ff1744', '#d50000']}
+            style={styles.actionButtonGradient}
+          >
+            <MaterialIcons name="warning" size={20} color="white" />
+            <Text style={styles.sosActionText}>Emergency SOS</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      </View>
+    </View>
   );
-}
+});
+
+export default HomeScreen;
 
 const styles = StyleSheet.create({
-  container: {
+  // Modern Container
+  modernContainer: {
     flex: 1,
-    backgroundColor: theme.colors.background
+    backgroundColor: '#f5f7fa',
   },
-  headerContainer: {
-    paddingTop: Platform.OS === 'ios' ? 0 : theme.spacing.lg,
-    paddingBottom: theme.spacing.md
+
+  // Loading Styles
+  loadingHeader: {
+    paddingTop: 50,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingHeaderText: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: 'white',
+    marginTop: 12,
+  },
+  loadingContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modernLoadingText: {
+    marginTop: 16,
+    fontSize: 16,
+    color: '#666',
+  },
+
+  // Modern Header
+  modernHeader: {
+    paddingTop: 50,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
   },
   headerContent: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: theme.spacing.lg
+    alignItems: 'center',
   },
   headerLeft: {
-    flex: 1
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  headerTextContainer: {
+    marginLeft: 12,
   },
   headerTitle: {
-    ...theme.typography.h2,
-    color: theme.colors.text.white,
-    fontWeight: 'bold'
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: 'white',
   },
-  headerSubtitle: {
-    ...theme.typography.body2,
-    color: theme.colors.text.white,
-    opacity: 0.9
-  },
-  profileButton: {
-    padding: theme.spacing.xs
-  },
-  statsContainer: {
-    marginVertical: theme.spacing.md
-  },
-  statsScrollContent: {
-    paddingHorizontal: theme.spacing.lg
-  },
-  statCard: {
-    marginRight: theme.spacing.md,
-    minWidth: 140,
-    borderRadius: theme.borderRadius.xl
-  },
-  statContent: {
+  connectionStatusContainer: {
     flexDirection: 'row',
-    alignItems: 'center'
+    alignItems: 'center',
+    marginTop: 4,
   },
-  statText: {
-    marginLeft: theme.spacing.md,
-    flex: 1
+  connectionDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
   },
-  statNumber: {
-    ...theme.typography.h3,
-    color: theme.colors.text.white,
-    fontWeight: 'bold'
+  connectionText: {
+    fontSize: 12,
+    color: '#e8eaf6',
   },
-  statLabel: {
-    ...theme.typography.caption,
-    color: theme.colors.text.white,
-    opacity: 0.9,
-    marginTop: 2
+  refreshButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
+
+  // Analytics Cards
+  analyticsRow: {
+    flexDirection: 'row',
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    gap: 16,
+  },
+  analyticsCard: {
+    flex: 1,
+    height: 100,
+    borderRadius: 16,
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  cardGradient: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 12,
+  },
+  cardValue: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: 'white',
+    marginTop: 8,
+  },
+  cardLabel: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.9)',
+    textAlign: 'center',
+    marginTop: 4,
+    fontWeight: '500',
+  },
+
+  // Full Map Section
+  fullMapContainer: {
+    flex: 1,
+    backgroundColor: 'white',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
+    overflow: 'hidden',
+  },
+  // Map Section (legacy - keep for compatibility)
   mapContainer: {
     flex: 1,
-    paddingHorizontal: theme.spacing.lg
-  },
-  mapCard: {
-    flex: 1,
-    padding: 0,
-    overflow: 'hidden'
+    backgroundColor: 'white',
+    margin: 16,
+    borderRadius: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
+    overflow: 'hidden',
   },
   mapHeader: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    padding: theme.spacing.md,
+    alignItems: 'center',
+    padding: 16,
+    backgroundColor: '#fafafa',
     borderBottomWidth: 1,
-    borderBottomColor: theme.colors.text.light
+    borderBottomColor: '#f0f0f0',
   },
   mapTitle: {
-    ...theme.typography.h4,
-    color: theme.colors.text.primary
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
   },
-  map: {
+  clearSelectionButton: {
+    backgroundColor: '#f5f5f5',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  clearSelectionText: {
+    fontSize: 12,
+    color: '#666',
+    fontWeight: '500',
+  },
+  modernMap: {
     flex: 1,
-    minHeight: 300
+    minHeight: 200,
   },
-  customMarker: {
+
+  // Emergency Marker
+  emergencyMarker: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#ff1744',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: 'white',
+  },
+
+  // Selected Worker Info
+  selectedWorkerInfo: {
+    position: 'absolute',
+    bottom: 16,
+    left: 16,
+    right: 16,
+  },
+  workerInfoCard: {
+    flexDirection: 'row',
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 12,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  workerInfoLeft: {
+    flex: 1,
+  },
+  selectedWorkerTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  selectedWorkerDetails: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+  },
+  navigateIconButton: {
     width: 40,
     height: 40,
     borderRadius: 20,
+    backgroundColor: '#2196f3',
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 3,
-    borderColor: theme.colors.surface
+    marginLeft: 12,
   },
-  selectedWorkerInfo: {
-    position: 'absolute',
-    bottom: theme.spacing.md,
-    left: theme.spacing.md,
-    right: theme.spacing.md,
-    backgroundColor: theme.colors.surface,
-    borderRadius: theme.borderRadius.lg,
-    padding: theme.spacing.md,
+
+  // Bottom Actions
+  bottomActions: {
+    flexDirection: 'row',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'white',
+    gap: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#f0f0f0',
+  },
+  modernViewButton: {
+    flex: 1,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  modernSosButton: {
+    flex: 1,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  actionButtonGradient: {
     flexDirection: 'row',
     alignItems: 'center',
-    ...theme.shadows.medium
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    gap: 8,
   },
-  workerInfoContent: {
-    flex: 1,
-    marginRight: theme.spacing.md
-  },
-  workerInfoTitle: {
-    ...theme.typography.body1,
+  actionButtonText: {
+    color: 'white',
+    fontSize: 14,
     fontWeight: '600',
-    color: theme.colors.text.primary,
-    marginBottom: 4
   },
-  workerInfoDistance: {
-    ...theme.typography.body2,
-    color: theme.colors.text.secondary,
-    marginBottom: theme.spacing.xs
+  sosActionText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: 'bold',
   },
-  actionContainer: {
-    paddingHorizontal: theme.spacing.lg,
-    paddingVertical: theme.spacing.md,
-    paddingBottom: Platform.OS === 'ios' ? theme.spacing.xl : theme.spacing.md
-  },
-  actionButtons: {
-    flexDirection: 'row',
-    alignItems: 'center'
-  }
 });

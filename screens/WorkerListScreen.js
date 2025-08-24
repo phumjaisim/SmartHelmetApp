@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   FlatList,
@@ -8,75 +8,113 @@ import {
   StyleSheet,
   Alert,
   Modal,
-  SafeAreaView,
-  RefreshControl,
-  Platform
+  TextInput,
+  ActivityIndicator,
+  StatusBar,
+  Dimensions,
+  ScrollView,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Ionicons } from '@expo/vector-icons';
+import { FontAwesome, MaterialIcons, Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { connectToMQTT, onMQTTMessage, disconnectMQTT } from '../mqttClient';
-import { Button, Input, Card, StatusBadge, EmptyState } from '../components/UIComponents';
-import { theme } from '../theme';
-import * as Animatable from 'react-native-animatable';
+import { connectToMQTT, onMQTTMessage } from '../mqttClient';
+import { formatHelmetStatus, validateWorkerData, safeJsonParse } from '../utils';
 
-export default function WorkerListScreen({ navigation }) {
+const { width } = Dimensions.get('window');
+
+const WorkerListScreen = React.memo(({ navigation }) => {
   const [workers, setWorkers] = useState([]);
   const [modalVisible, setModalVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchField, setSearchField] = useState('name');
   const [mqttDataMap, setMqttDataMap] = useState({});
-  const [refreshing, setRefreshing] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isProcessingFile, setIsProcessingFile] = useState(false);
 
   useEffect(() => {
     loadWorkers();
-  }, []);
+  }, [loadWorkers]);
 
   useEffect(() => {
-    connectToMQTT();
+    const initializeMQTT = async () => {
+      try {
+        await connectToMQTT();
+        
+        const unsubscribe = onMQTTMessage((data) => {
+          setMqttDataMap((prev) => {
+            const prevData = prev[data.hatId];
+            if (prevData && 
+                prevData.helmetStatus === data.helmetStatus && 
+                prevData.heartRate === data.heartRate) {
+              return prev; // No change, prevent re-render
+            }
+            return {
+              ...prev,
+              [data.hatId]: {
+                helmetStatus: data.helmetStatus,
+                heartRate: data.heartRate, // Keep original value (including 0, null, undefined)
+                timestamp: new Date().toISOString(),
+              },
+            };
+          });
+        });
 
-    onMQTTMessage((data) => {
-      setMqttDataMap((prev) => ({
-        ...prev,
-        [data.hatId]: data.helmetStatus,
-      }));
+        return unsubscribe;
+      } catch (error) {
+        console.error('MQTT connection error:', error);
+      }
+    };
+
+    let cleanupFn = null;
+    initializeMQTT().then(cleanup => {
+      cleanupFn = cleanup;
     });
 
     return () => {
-      disconnectMQTT();
+      if (cleanupFn) cleanupFn();
     };
   }, []);
 
-  const loadWorkers = async () => {
+  const loadWorkers = useCallback(async () => {
     try {
+      setIsLoading(true);
       const stored = await AsyncStorage.getItem('workers');
       if (stored) {
-        setWorkers(JSON.parse(stored));
+        const parsedWorkers = safeJsonParse(stored, []);
+        // Validate and normalize worker data
+        const validatedWorkers = parsedWorkers.map(validateWorkerData);
+        setWorkers(validatedWorkers);
       }
     } catch (error) {
-      alert('โหลดข้อมูลล้มเหลว');
+      console.error('Load workers error:', error);
+      Alert.alert('ข้อผิดพลาด', 'โหลดข้อมูลล้มเหลว');
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, []);
 
-  const saveWorkers = async (newData) => {
+  const saveWorkers = useCallback(async (newData) => {
     try {
       await AsyncStorage.setItem('workers', JSON.stringify(newData));
       setWorkers(newData);
     } catch (error) {
-      alert('บันทึกข้อมูลล้มเหลว');
+      console.error('Save workers error:', error);
+      Alert.alert('ข้อผิดพลาด', 'บันทึกข้อมูลล้มเหลว');
     }
-  };
+  }, []);
 
-  const handleFilePick = async () => {
+  const handleFilePick = useCallback(async () => {
     try {
+      setIsProcessingFile(true);
       const result = await DocumentPicker.getDocumentAsync({ type: '*/*' });
-      if (result.canceled || !result.assets) return;
+      if (result.canceled || !result.assets) {
+        setIsProcessingFile(false);
+        return;
+      }
 
       const fileUri = result.assets[0].uri;
       const fileName = result.assets[0].name;
@@ -92,294 +130,330 @@ export default function WorkerListScreen({ navigation }) {
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         newData = XLSX.utils.sheet_to_json(sheet);
       } else {
-        alert('ไฟล์ไม่รองรับ! กรุณาเลือก .csv หรือ .xlsx');
+        Alert.alert('ไฟล์ไม่รองรับ', 'กรุณาเลือก .csv หรือ .xlsx');
+        setIsProcessingFile(false);
         return;
       }
 
-      newData = newData.map((item) => ({
-        hatId: item.hatId?.toString(),
-        name: item.name || '',
-        role: item.role || '',
-        bloodType: item.bloodType || '',
-        nationality: item.nationality || '',
-        image: item.image || '',
-        age: item.age || '',
-        gender: item.gender || '',
-      }));
+      // Validate and normalize imported data
+      newData = newData.map(validateWorkerData);
 
-      Alert.alert('ต้องการดำเนินการอย่างไร?', '', [
-        {
-          text: 'เพิ่มใหม่',
-          onPress: () => {
-            const combined = [...workers];
-            newData.forEach((item) => {
-              const isDuplicate = combined.some((w) => w.hatId === item.hatId && w.name === item.name);
-              if (!isDuplicate) {
-                combined.push(item);
-              }
-            });
-            saveWorkers(combined);
-          },
-        },
-        {
-          text: 'แทนที่ทั้งหมด',
-          onPress: () => saveWorkers(newData),
-          style: 'destructive',
-        },
-        { text: 'ยกเลิก', style: 'cancel' },
-      ]);
+      const handleAddData = () => {
+        const combined = [...workers];
+        newData.forEach((item) => {
+          const isDuplicate = combined.some((w) => w.hatId === item.hatId && w.name === item.name);
+          if (!isDuplicate) {
+            combined.push(item);
+          }
+        });
+        saveWorkers(combined);
+      };
+
+      const handleReplaceData = () => {
+        saveWorkers(newData);
+      };
+
+      Alert.alert(
+        'Import Data',
+        'How would you like to proceed?',
+        [
+          { text: 'Add New', onPress: handleAddData },
+          { text: 'Replace All', onPress: handleReplaceData, style: 'destructive' },
+          { text: 'Cancel', style: 'cancel' },
+        ]
+      );
     } catch (error) {
-      alert('เกิดข้อผิดพลาด: ' + error.message);
+      console.error('File processing error:', error);
+      Alert.alert('ข้อผิดพลาด', 'เกิดข้อผิดพลาด: ' + error.message);
+    } finally {
+      setIsProcessingFile(false);
     }
-  };
+  }, [workers, saveWorkers]);
 
-  const onRefresh = async () => {
-    setRefreshing(true);
-    await loadWorkers();
-    setTimeout(() => {
-      setRefreshing(false);
-    }, 1000);
-  };
-
-  const filteredWorkers = workers.filter((worker) =>
-    worker[searchField]?.toString().toLowerCase().includes(searchQuery.toLowerCase())
+  // Memoized filtered workers for performance
+  const filteredWorkers = useMemo(() => 
+    workers.filter((worker) =>
+      worker[searchField]?.toString().toLowerCase().includes(searchQuery.toLowerCase())
+    ), 
+    [workers, searchField, searchQuery]
   );
 
-  const getStatusInfo = (hatId) => {
-    const status = mqttDataMap[hatId];
-    if (status === '0' || status === 0) {
-      return { status: 'normal', text: 'ปกติ', color: theme.colors.status.success };
-    } else if (status === '1' || status === 1) {
-      return { status: 'sos', text: 'ฉุกเฉิน', color: theme.colors.status.danger };
-    } else {
-      return { status: 'offline', text: 'ออฟไลน์', color: theme.colors.status.offline };
-    }
-  };
-
-  const renderWorkerCard = ({ item, index }) => {
-    const statusInfo = getStatusInfo(item.hatId);
+  // Memoized render item for FlatList performance
+  const renderItem = useCallback(({ item }) => {
+    const mqttData = mqttDataMap[item.hatId];
     
+    // Use real-time heartRate data directly - old algorithm
+    let heartRate = 'N/A';
+    if (mqttData && mqttData.heartRate !== undefined && mqttData.heartRate !== null) {
+      heartRate = mqttData.heartRate;
+      // If it's 0, keep it as 0
+      if (heartRate === 0) {
+        heartRate = '0';
+      }
+    }
+    
+    const status = mqttData?.helmetStatus;
+    const { text: statusText, color } = formatHelmetStatus(status);
+    
+    const isConnected = !!mqttData;
+    
+    // Original heartbeat status logic
+    let heartRateStatus = 'unknown';
+    if (heartRate !== 'N/A' && heartRate !== '0') {
+      const bpm = parseInt(heartRate);
+      if (bpm >= 60 && bpm <= 100) {
+        heartRateStatus = 'normal';
+      } else {
+        heartRateStatus = 'warning';
+      }
+    } else if (heartRate === '0') {
+      heartRateStatus = 'warning'; // 0 BPM is concerning
+    }
+    
+    // Check for SOS mode
+    const isSOS = status === 'SOS' || statusText === 'SOS';
+    const isEmergency = isSOS || status === 'EMERGENCY';
+    
+    // Determine status display
+    let displayStatus = 'Offline';
+    let statusColor = '#9e9e9e'; // Grey for offline
+    
+    if (isConnected) {
+      if (isEmergency) {
+        displayStatus = 'SOS';
+        statusColor = '#ff1744'; // Red for SOS
+      } else {
+        displayStatus = 'Online';
+        statusColor = '#4caf50'; // Green for online
+      }
+    }
+
     return (
-      <Animatable.View 
-        animation="fadeInUp" 
-        delay={index * 100}
-        duration={600}
+      <TouchableOpacity
+        style={[styles.workerCard, isEmergency && styles.workerCardEmergency]}
+        onPress={() => navigation.navigate('WorkerDetails', { worker: item })}
+        activeOpacity={0.7}
       >
-        <Card style={styles.workerCard}>
-          <TouchableOpacity
-            style={styles.workerContent}
-            onPress={() => navigation.navigate('WorkerDetails', { worker: item })}
-            activeOpacity={0.7}
-          >
-            <View style={styles.workerInfo}>
-              <Image
-                source={{
-                  uri: item.image?.startsWith('data:image') 
-                    ? item.image 
-                    : item.image || 'https://via.placeholder.com/60'
-                }}
-                style={styles.workerAvatar}
-              />
-              <View style={styles.workerDetails}>
-                <Text style={styles.workerName}>{item.name}</Text>
-                <Text style={styles.workerRole}>{item.role}</Text>
-                <Text style={styles.workerHatId}>หมวก ID: {item.hatId}</Text>
+        <View style={styles.cardContent}>
+          <Image
+            source={{
+              uri: item.image?.startsWith('data:image') ? item.image : item.image || 'https://via.placeholder.com/60',
+            }}
+            style={[styles.workerAvatar, isEmergency && styles.workerAvatarEmergency]}
+          />
+          
+          <View style={styles.workerInfo}>
+            <View style={styles.workerNameRow}>
+              <Text style={[styles.workerName, isEmergency && styles.workerNameEmergency]}>{item.name}</Text>
+              <View style={styles.heartRateContainer}>
+                <FontAwesome 
+                  name="heartbeat" 
+                  size={14} 
+                  color={heartRateStatus === 'warning' ? '#ff9800' : heartRateStatus === 'normal' ? '#4caf50' : '#9e9e9e'} 
+                />
+                <Text style={styles.heartRateText}>{heartRate}</Text>
               </View>
             </View>
             
-            <View style={styles.workerStatus}>
-              <StatusBadge 
-                status={statusInfo.status} 
-                text={statusInfo.text}
-                size="large"
-              />
-              <Ionicons 
-                name="chevron-forward" 
-                size={20} 
-                color={theme.colors.text.secondary}
-                style={{ marginTop: theme.spacing.xs }}
-              />
+            <View style={styles.workerDetailsRow}>
+              <View style={styles.roleContainer}>
+                <Ionicons name="briefcase" size={14} color="#666" />
+                <Text style={styles.workerRole}>{item.role || 'Worker'}</Text>
+              </View>
+              
+              <View style={styles.helmetContainer}>
+                <Text style={styles.helmetId}>HELMET ID: </Text>
+                <Text style={styles.helmetId}>{item.hatId || 'N/A'}</Text>
+              </View>
             </View>
-          </TouchableOpacity>
-        </Card>
-      </Animatable.View>
+          </View>
+          
+          <View style={styles.statusIndicator}>
+            <View style={[styles.connectionDot, { backgroundColor: statusColor }]} />
+            <Text style={[styles.connectionText, { color: isEmergency ? statusColor : '#666' }]}>
+              {displayStatus}
+            </Text>
+          </View>
+        </View>
+      </TouchableOpacity>
     );
-  };
+  }, [mqttDataMap, navigation]);
 
-  const renderHeader = () => (
-    <View>
-      {/* Search Section */}
-      <Animatable.View animation="fadeInDown" duration={600}>
-        <Card style={styles.searchCard}>
-          <View style={styles.searchHeader}>
-            <Ionicons name="search" size={24} color={theme.colors.primary} />
-            <Text style={styles.searchTitle}>ค้นหาพนักงาน</Text>
-          </View>
-          
-          <Input
-            placeholder={`ค้นหาโดย${searchField === 'name' ? 'ชื่อ' : 'ตำแหน่ง'}`}
-            icon="search"
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            style={{ marginBottom: theme.spacing.md }}
-          />
-          
-          <View style={styles.filterButtons}>
-            <Button
-              title="ชื่อ"
-              variant={searchField === 'name' ? 'primary' : 'outline'}
-              size="small"
-              onPress={() => setSearchField('name')}
-              style={{ flex: 1, marginRight: theme.spacing.xs }}
-            />
-            <Button
-              title="ตำแหน่ง"
-              variant={searchField === 'role' ? 'primary' : 'outline'}
-              size="small"
-              onPress={() => setSearchField('role')}
-              style={{ flex: 1, marginLeft: theme.spacing.xs }}
-            />
-          </View>
-        </Card>
-      </Animatable.View>
-      
-      {/* Stats */}
-      <Animatable.View animation="fadeInUp" delay={200} duration={600} style={styles.statsRow}>
-        <View style={styles.statItem}>
-          <Text style={styles.statNumber}>{workers.length}</Text>
-          <Text style={styles.statLabel}>ทั้งหมด</Text>
-        </View>
-        <View style={styles.statItem}>
-          <Text style={styles.statNumber}>
-            {workers.filter(w => getStatusInfo(w.hatId).status === 'normal').length}
-          </Text>
-          <Text style={styles.statLabel}>ปกติ</Text>
-        </View>
-        <View style={styles.statItem}>
-          <Text style={styles.statNumber}>
-            {workers.filter(w => getStatusInfo(w.hatId).status === 'sos').length}
-          </Text>
-          <Text style={styles.statLabel}>ฉุกเฉิน</Text>
-        </View>
-        <View style={styles.statItem}>
-          <Text style={styles.statNumber}>
-            {workers.filter(w => getStatusInfo(w.hatId).status === 'offline').length}
-          </Text>
-          <Text style={styles.statLabel}>ออฟไลน์</Text>
-        </View>
-      </Animatable.View>
-    </View>
+  const keyExtractor = useCallback((item, index) => 
+    item.hatId?.toString() || index.toString(), []
   );
 
+  if (isLoading) {
+    return (
+      <View style={styles.modernContainer}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a237e" />
+        <LinearGradient
+          colors={['#1a237e', '#3949ab']}
+          style={styles.loadingHeader}
+        >
+          <Text style={styles.loadingHeaderText}>Smart Helmet Monitor</Text>
+        </LinearGradient>
+        <View style={styles.loadingContent}>
+          <ActivityIndicator size="large" color="#1976d2" />
+          <Text style={styles.modernLoadingText}>Loading workers...</Text>
+        </View>
+      </View>
+    );
+  }
+
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
+    <View style={styles.modernContainer}>
+      <StatusBar barStyle="light-content" backgroundColor="#1a237e" />
       
-      {/* Header */}
+      {/* Modern Header */}
       <LinearGradient
-        colors={theme.colors.gradient.secondary}
-        style={styles.header}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 0 }}
+        colors={['#1a237e', '#3949ab']}
+        style={styles.modernHeader}
       >
         <View style={styles.headerContent}>
-          <TouchableOpacity onPress={() => navigation.goBack()}>
-            <Ionicons name="arrow-back" size={28} color={theme.colors.text.white} />
+          <TouchableOpacity 
+            style={styles.backButton}
+            onPress={() => navigation.goBack()}
+          >
+            <MaterialIcons name="arrow-back" size={24} color="white" />
           </TouchableOpacity>
-          <View style={styles.headerTitleContainer}>
-            <Text style={styles.headerTitle}>รายชื่อพนักงาน</Text>
-            <Text style={styles.headerSubtitle}>จัดการข้อมูลพนักงาน</Text>
+          
+          <View style={styles.headerCenter}>
+            <MaterialIcons name="groups" size={32} color="white" />
+            <View style={styles.headerTextContainer}>
+              <Text style={styles.headerTitle}>Workers</Text>
+              <Text style={styles.headerSubtitle}>{filteredWorkers.length} total</Text>
+            </View>
           </View>
+          
           <TouchableOpacity 
             style={styles.addButton}
             onPress={() => setModalVisible(true)}
+            disabled={isProcessingFile}
           >
-            <Ionicons name="add" size={28} color={theme.colors.text.white} />
+            <MaterialIcons name="add" size={24} color="white" />
           </TouchableOpacity>
         </View>
       </LinearGradient>
 
-      {/* Content */}
-      {filteredWorkers.length === 0 && workers.length === 0 ? (
-        <EmptyState
-          icon="people"
-          title="ไม่มีข้อมูลพนักงาน"
-          subtitle="เริ่มต้นโดยการเพิ่มไฟล์รายชื่อพนักงาน"
-          actionButton={
-            <Button
-              title="เพิ่มรายชื่อ"
-              icon="add"
-              onPress={() => setModalVisible(true)}
-              style={{ marginTop: theme.spacing.lg }}
-            />
-          }
-        />
-      ) : (
-        <FlatList
-          data={filteredWorkers}
-          keyExtractor={(item, index) => item.hatId?.toString() || index.toString()}
-          renderItem={renderWorkerCard}
-          ListHeaderComponent={renderHeader}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl 
-              refreshing={refreshing} 
-              onRefresh={onRefresh}
-              colors={[theme.colors.primary]}
-              tintColor={theme.colors.primary}
-            />
-          }
-          ListEmptyComponent={() => (
-            <Animatable.View animation="fadeInUp" duration={600}>
-              <EmptyState
-                icon="search"
-                title="ไม่พบผลการค้นหา"
-                subtitle={`ไม่พบพนักงานที่มี${searchField === 'name' ? 'ชื่อ' : 'ตำแหน่ง'} "${searchQuery}"`}
-              />
-            </Animatable.View>
+      {/* Modern Search */}
+      <View style={styles.modernSearchContainer}>
+        <View style={styles.searchBarContainer}>
+          <Ionicons name="search" size={20} color="#666" style={styles.searchIcon} />
+          <TextInput
+            style={styles.modernSearchInput}
+            placeholder={`Search by ${searchField === 'name' ? 'name' : 'role'}...`}
+            placeholderTextColor="#999"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity 
+              onPress={() => setSearchQuery('')}
+              style={styles.clearButton}
+            >
+              <Ionicons name="close-circle" size={20} color="#999" />
+            </TouchableOpacity>
           )}
-        />
-      )}
+        </View>
+        
+        <View style={styles.filterContainer}>
+          <TouchableOpacity 
+            style={[styles.filterButton, searchField === 'name' && styles.filterButtonActive]}
+            onPress={() => setSearchField('name')}
+          >
+            <Ionicons name="person" size={16} color={searchField === 'name' ? 'white' : '#666'} />
+            <Text style={[styles.filterButtonText, searchField === 'name' && styles.filterButtonTextActive]}>
+              Name
+            </Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.filterButton, searchField === 'role' && styles.filterButtonActive]}
+            onPress={() => setSearchField('role')}
+          >
+            <Ionicons name="briefcase" size={16} color={searchField === 'role' ? 'white' : '#666'} />
+            <Text style={[styles.filterButtonText, searchField === 'role' && styles.filterButtonTextActive]}>
+              Role
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
 
-      {/* Import Modal */}
-      <Modal 
-        visible={modalVisible} 
-        animationType="slide" 
-        transparent={true}
-      >
-        <View style={styles.modalOverlay}>
-          <Animatable.View animation="slideInUp" style={styles.modalContent}>
+      {/* Workers List */}
+      <View style={styles.listContainer}>
+        {filteredWorkers.length === 0 ? (
+          <View style={styles.emptyState}>
+            <MaterialIcons name="groups" size={64} color="#ddd" />
+            <Text style={styles.emptyStateText}>No workers found</Text>
+            <Text style={styles.emptyStateSubtext}>
+              {searchQuery ? 'Try adjusting your search' : 'Import worker data to get started'}
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={filteredWorkers}
+            keyExtractor={keyExtractor}
+            renderItem={renderItem}
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.flatListContent}
+            removeClippedSubviews={true}
+            maxToRenderPerBatch={10}
+            windowSize={10}
+            initialNumToRender={10}
+          />
+        )}
+      </View>
+
+      {/* Modern Modal */}
+      <Modal visible={modalVisible} animationType="slide" transparent={true}>
+        <View style={styles.modernModalOverlay}>
+          <View style={styles.modernModalContainer}>
+            {isProcessingFile && (
+              <View style={styles.modernProcessingOverlay}>
+                <ActivityIndicator size="large" color="#1976d2" />
+                <Text style={styles.modernProcessingText}>Processing file...</Text>
+              </View>
+            )}
+            
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>เพิ่มรายชื่อพนักงาน</Text>
-              <TouchableOpacity onPress={() => setModalVisible(false)}>
-                <Ionicons name="close" size={24} color={theme.colors.text.secondary} />
+              <Text style={styles.modalTitle}>Import Workers</Text>
+              <TouchableOpacity 
+                onPress={() => setModalVisible(false)}
+                disabled={isProcessingFile}
+                style={styles.closeButton}
+              >
+                <Ionicons name="close" size={24} color="#666" />
               </TouchableOpacity>
             </View>
             
-            <Text style={styles.modalDescription}>
-              เลือกไฟล์ CSV หรือ Excel ที่มีข้อมูลพนักงาน
-            </Text>
-            
-            <View style={styles.modalButtons}>
-              <Button
-                title="เลือกไฟล์"
-                icon="document"
+            <View style={styles.modalContent}>
+              <TouchableOpacity 
+                style={styles.importButton}
                 onPress={handleFilePick}
-                style={{ marginBottom: theme.spacing.md }}
-              />
-              <Button
-                title="ยกเลิก"
-                variant="outline"
-                onPress={() => setModalVisible(false)}
-              />
+                disabled={isProcessingFile}
+              >
+                <LinearGradient
+                  colors={['#2196f3', '#1976d2']}
+                  style={styles.importButtonGradient}
+                >
+                  <MaterialIcons name="upload-file" size={24} color="white" />
+                  <Text style={styles.importButtonText}>Select File (.csv or .xlsx)</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+              
+              <Text style={styles.modalDescription}>
+                Import worker data from CSV or Excel files. You can choose to add new workers or replace existing data.
+              </Text>
             </View>
-          </Animatable.View>
+          </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
-}
+});
+
+export default WorkerListScreen;
 
 export function WorkerDetailScreen({ route }) {
   const { worker } = route.params;
@@ -397,149 +471,381 @@ export function WorkerDetailScreen({ route }) {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  // Modern Container
+  modernContainer: {
     flex: 1,
-    backgroundColor: theme.colors.background
+    backgroundColor: '#f5f5f5',
   },
-  header: {
-    paddingTop: Platform.OS === 'ios' ? 0 : theme.spacing.lg,
-    paddingBottom: theme.spacing.md
+  
+  // Loading Styles
+  loadingHeader: {
+    paddingTop: 50,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+  },
+  loadingHeaderText: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: 'white',
+  },
+  loadingContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modernLoadingText: {
+    marginTop: 16,
+    fontSize: 16,
+    color: '#666',
+  },
+  
+  // Modern Header
+  modernHeader: {
+    paddingTop: 50,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
   },
   headerContent: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: theme.spacing.lg
   },
-  headerTitleContainer: {
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
     flex: 1,
-    marginHorizontal: theme.spacing.md
+  },
+  headerTextContainer: {
+    marginLeft: 12,
   },
   headerTitle: {
-    ...theme.typography.h3,
-    color: theme.colors.text.white,
-    fontWeight: 'bold'
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: 'white',
   },
   headerSubtitle: {
-    ...theme.typography.body2,
-    color: theme.colors.text.white,
-    opacity: 0.9
+    fontSize: 14,
+    color: '#e8eaf6',
+    marginTop: 2,
+  },
+  backButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerCenter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'center',
   },
   addButton: {
-    padding: theme.spacing.xs
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  listContent: {
-    padding: theme.spacing.lg,
-    paddingBottom: theme.spacing.xxl
+  
+  // Modern Search
+  modernSearchContainer: {
+    backgroundColor: 'white',
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
   },
-  searchCard: {
-    marginBottom: theme.spacing.lg
-  },
-  searchHeader: {
+  searchBarContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: theme.spacing.md
+    backgroundColor: '#f8f9fa',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    marginBottom: 12,
   },
-  searchTitle: {
-    ...theme.typography.h4,
-    color: theme.colors.text.primary,
-    marginLeft: theme.spacing.md
+  searchIcon: {
+    marginRight: 8,
   },
-  filterButtons: {
-    flexDirection: 'row'
+  modernSearchInput: {
+    flex: 1,
+    height: 44,
+    fontSize: 16,
+    color: '#333',
   },
-  statsRow: {
+  clearButton: {
+    marginLeft: 8,
+  },
+  filterContainer: {
     flexDirection: 'row',
-    justifyContent: 'space-around',
-    marginBottom: theme.spacing.lg
+    gap: 8,
   },
-  statItem: {
-    alignItems: 'center'
+  filterButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: '#f0f0f0',
+    gap: 6,
   },
-  statNumber: {
-    ...theme.typography.h3,
-    color: theme.colors.primary,
-    fontWeight: 'bold'
+  filterButtonActive: {
+    backgroundColor: '#1976d2',
   },
-  statLabel: {
-    ...theme.typography.caption,
-    color: theme.colors.text.secondary,
-    marginTop: 4
+  filterButtonText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#666',
   },
+  filterButtonTextActive: {
+    color: 'white',
+  },
+  
+  // List Container
+  listContainer: {
+    flex: 1,
+  },
+  flatListContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  
+  // Worker Cards
   workerCard: {
-    marginBottom: theme.spacing.md,
-    borderRadius: theme.borderRadius.lg
+    backgroundColor: 'white',
+    borderRadius: 16,
+    marginVertical: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
   },
-  workerContent: {
+  cardContent: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 0
-  },
-  workerInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1
+    padding: 16,
   },
   workerAvatar: {
     width: 60,
     height: 60,
     borderRadius: 30,
-    marginRight: theme.spacing.md
+    marginRight: 16,
+    borderWidth: 2,
+    borderColor: '#f0f0f0',
   },
-  workerDetails: {
-    flex: 1
+  workerInfo: {
+    flex: 1,
+  },
+  workerNameRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
   },
   workerName: {
-    ...theme.typography.body1,
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+    flex: 1,
+  },
+  heartRateContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f8f9fa',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    gap: 4,
+  },
+  heartRateText: {
+    fontSize: 12,
     fontWeight: '600',
-    color: theme.colors.text.primary,
-    marginBottom: 4
+    color: '#333',
+  },
+  workerDetailsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  roleContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flex: 1,
   },
   workerRole: {
-    ...theme.typography.body2,
-    color: theme.colors.text.secondary,
-    marginBottom: 4
+    fontSize: 14,
+    color: '#666',
   },
-  workerHatId: {
-    ...theme.typography.caption,
-    color: theme.colors.text.light,
-    fontWeight: '500'
+  helmetContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
   },
-  workerStatus: {
-    alignItems: 'center'
+  helmetId: {
+    fontSize: 12,
+    color: '#666',
+    fontFamily: 'monospace',
   },
-  modalOverlay: {
+  statusIndicator: {
+    alignItems: 'center',
+    marginLeft: 12,
+  },
+  connectionDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginBottom: 4,
+  },
+  connectionText: {
+    fontSize: 10,
+    color: '#666',
+    fontWeight: '500',
+  },
+  
+  // Emergency/SOS Styles
+  workerCardEmergency: {
+    borderWidth: 2,
+    borderColor: '#ff1744',
+    backgroundColor: '#fff5f5',
+  },
+  workerAvatarEmergency: {
+    borderColor: '#ff1744',
+    borderWidth: 3,
+  },
+  workerNameEmergency: {
+    color: '#d32f2f',
+  },
+  emergencyPulse: {
+    position: 'absolute',
+    top: -8,
+    left: -8,
+    right: -8,
+    bottom: -8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emergencyPulseRing: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#ff1744',
+    opacity: 0.6,
+  },
+  
+  // Empty State
+  emptyState: {
     flex: 1,
-    backgroundColor: theme.colors.shadow.dark,
-    justifyContent: 'flex-end'
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
   },
-  modalContent: {
-    backgroundColor: theme.colors.surface,
-    borderTopLeftRadius: theme.borderRadius.xxl,
-    borderTopRightRadius: theme.borderRadius.xxl,
-    padding: theme.spacing.xl,
-    minHeight: 280
+  emptyStateText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#999',
+    marginTop: 16,
+    textAlign: 'center',
+  },
+  emptyStateSubtext: {
+    fontSize: 14,
+    color: '#bbb',
+    marginTop: 8,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  
+  // Modern Modal
+  modernModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modernModalContainer: {
+    backgroundColor: 'white',
+    borderRadius: 20,
+    margin: 20,
+    maxWidth: width - 40,
+    width: '100%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 5,
   },
   modalHeader: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: theme.spacing.lg
+    alignItems: 'center',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
   },
   modalTitle: {
-    ...theme.typography.h3,
-    color: theme.colors.text.primary
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  closeButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    padding: 20,
+  },
+  importButton: {
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginBottom: 16,
+  },
+  importButtonGradient: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    gap: 8,
+  },
+  importButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
   },
   modalDescription: {
-    ...theme.typography.body1,
-    color: theme.colors.text.secondary,
+    fontSize: 14,
+    color: '#666',
+    lineHeight: 20,
     textAlign: 'center',
-    marginBottom: theme.spacing.xl,
-    lineHeight: 24
   },
-  modalButtons: {
-    gap: theme.spacing.md
+  modernProcessingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 20,
+    zIndex: 1000,
   },
-  // Legacy styles for WorkerDetailScreen
+  modernProcessingText: {
+    marginTop: 12,
+    fontSize: 16,
+    color: '#666',
+    fontWeight: '500',
+  },
+  
+  // Legacy styles (kept for compatibility)
   detailContainer: {
     flex: 1,
     alignItems: 'center',
@@ -558,5 +864,5 @@ const styles = StyleSheet.create({
   detailRole: {
     fontSize: 20,
     color: 'gray',
-  }
+  },
 });
